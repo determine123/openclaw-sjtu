@@ -88,6 +88,18 @@ def _get_body_preview(msg, max_len=200):
     return body[:max_len] + "..." if len(body) > max_len else body
 
 
+def normalize_username(username):
+    """补全 jAccount 用户名。
+
+    `scripts/setup.py` 把 `sjtu_username` 存成裸用户名（它自己拼域名），但 IMAP/SMTP
+    登录需要完整邮箱地址。两种写法都接受，避免照文档用向导配好后邮箱反而登录失败。
+    """
+    username = (username or "").strip()
+    if username and "@" not in username:
+        return username + "@sjtu.edu.cn"
+    return username
+
+
 def _connect_imap(username, password):
     """建立 IMAP 连接"""
     try:
@@ -101,8 +113,12 @@ def _connect_imap(username, password):
 
 
 def _parse_mail(conn, mail_id):
-    """解析单封邮件"""
-    _, data = conn.fetch(mail_id, "(RFC822)")
+    """解析单封邮件。
+
+    用 BODY.PEEK[] 而不是 RFC822：后者等价于 BODY[]，会在服务端置上 \\Seen 标记，
+    而「未读邮件」「邮箱概况」都是只读命令，不该改变邮箱状态。
+    """
+    _, data = conn.fetch(mail_id, "(BODY.PEEK[])")
     if not data or not data[0]:
         return None
     raw = data[0][1]
@@ -267,6 +283,8 @@ def main():
     if not username or not password:
         print("❌ 错误: 请提供用户名和密码 (命令行参数或 config.json)")
         sys.exit(1)
+
+    username = normalize_username(username)
 
     try:
         if args.action == "unread":
