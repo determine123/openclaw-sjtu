@@ -25,6 +25,8 @@ IMAP_PORT = 993
 SMTP_HOST = "mail.sjtu.edu.cn"
 SMTP_PORT = 465
 TIMEOUT = 10
+# 本地过滤式搜索最多回溯多少封邮件的件头（IMAP SEARCH 传不了非 ASCII 关键词）
+HEADER_SCAN_LIMIT = 300
 
 # config.json 在 scripts/ 的父目录（sjtu-canvas/config.json）
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -165,24 +167,51 @@ def get_unread_mails(username, password, limit=10):
             pass
 
 
+def _fetch_headers(conn, mail_id):
+    """只取 SUBJECT/FROM/DATE 三个头，用于本地关键词过滤。"""
+    _, data = conn.fetch(mail_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+    if not data or not data[0]:
+        return None
+    msg = email.message_from_bytes(data[0][1])
+    return {
+        "subject": _decode_str(msg.get("Subject", "")),
+        "from": _decode_str(msg.get("From", "")),
+    }
+
+
 def search_mails(username, password, keyword, limit=10):
-    """搜索邮件（按主题和发件人）"""
+    """按主题和发件人搜索邮件。
+
+    IMAP SEARCH 无法可靠承载非 ASCII 关键词：RFC 3501 不允许 8-bit 字节出现在
+    quoted string 中，而 imaplib 只会用 ASCII 编码 criteria。于是「作业」这类关键词
+    要么在本地抛 `UnicodeEncodeError`，要么被服务端拒绝：
+
+        SEARCH command error: BAD [b"parse error: illegal character ..."]
+
+    所以改为拉取最近的件头在本地做大小写不敏感匹配，中英文关键词行为一致。
+    """
     conn = _connect_imap(username, password)
     try:
         conn.select("INBOX")
-        # 搜索主题
-        _, data_subj = conn.search(None, f'SUBJECT "{keyword}"')
-        # 搜索发件人
-        _, data_from = conn.search(None, f'FROM "{keyword}"')
-        ids_subj = set(data_subj[0].split()) if data_subj[0] else set()
-        ids_from = set(data_from[0].split()) if data_from[0] else set()
-        all_ids = sorted(ids_subj | ids_from, key=lambda x: int(x))
-        if not all_ids:
+        _, data = conn.search(None, "ALL")
+        ids = data[0].split() if data and data[0] else []
+        if not ids:
             return []
-        all_ids = all_ids[-limit:]
-        all_ids.reverse()
+
+        # 只扫最近的 HEADER_SCAN_LIMIT 封，避免大邮箱把整箱件头都拉下来
+        needle = keyword.casefold()
+        matched = []
+        for mid in reversed(ids[-HEADER_SCAN_LIMIT:]):
+            head = _fetch_headers(conn, mid)
+            if not head:
+                continue
+            if needle in head["subject"].casefold() or needle in head["from"].casefold():
+                matched.append(mid)
+                if len(matched) >= limit:
+                    break
+
         results = []
-        for mid in all_ids:
+        for mid in matched:
             info = _parse_mail(conn, mid)
             if info:
                 results.append(info)
